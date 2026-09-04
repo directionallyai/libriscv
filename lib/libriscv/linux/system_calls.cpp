@@ -272,18 +272,18 @@ void syscall_getdents64(Machine<W>& machine)
 {
 	const int fd = machine.template sysarg<int>(0);
 	const auto g_dirp = machine.sysarg(1);
-	const auto count = machine.template sysarg<int>(2);
+	const auto count = machine.sysarg(2);
 
-	SYSPRINT("SYSCALL getdents64, fd: %d, dirp: 0x%lX, count: %d\n",
-		fd, (long)g_dirp, count);
-	(void)count;
+	SYSPRINT("SYSCALL getdents64, fd: %d, dirp: 0x%lX, count: %zu\n",
+		fd, (long)g_dirp, size_t(count));
 
 	if (machine.has_file_descriptors() && machine.fds().proxy_mode) {
 #if defined(__linux__) && defined(__LP64__)
 		const int real_fd = machine.fds().translate(fd);
 
 		char buffer[4096];
-		const int res = syscall(SYS_getdents64, real_fd, buffer, sizeof(buffer));
+		const size_t buffer_size = std::min<size_t>(count, sizeof(buffer));
+		const int res = syscall(SYS_getdents64, real_fd, buffer, buffer_size);
 		if (res > 0)
 		{
 			machine.copy_to_guest(g_dirp, buffer, res);
@@ -771,6 +771,21 @@ static void syscall_ioctl(Machine<W>& machine)
 			int res = ioctl(real_fd, req, &term);
 			if (req == TCGETS)
 				machine.copy_to_guest(arg1, &term, sizeof(term));
+			machine.set_result_or_error(res);
+			return;
+		}
+#endif
+
+#if defined(FIOCLEX) && defined(FIONCLEX)
+		if (machine.fds().proxy_mode && (req == FIOCLEX || req == FIONCLEX)) {
+			const int flags = fcntl(real_fd, F_GETFD);
+			if (flags < 0) {
+				machine.set_result_or_error(flags);
+				return;
+			}
+			const int updated = req == FIOCLEX
+				? flags | FD_CLOEXEC : flags & ~FD_CLOEXEC;
+			const int res = fcntl(real_fd, F_SETFD, updated);
 			machine.set_result_or_error(res);
 			return;
 		}

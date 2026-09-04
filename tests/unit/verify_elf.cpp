@@ -103,6 +103,90 @@ TEST_CASE("Rust Hello World", "[Verify]")
 	REQUIRE(state.text == "Hello World!\n");
 }
 
+#ifdef RISCV_VIRTUAL_PAGING
+TEST_CASE("Writable ELF BSS pages", "[Verify]")
+{
+	auto binary = load_file(cwd + "/elf/newlib-rv64gb-hello-world");
+	using Elf = riscv::Elf<RISCV64>;
+	const auto* elf = reinterpret_cast<const Elf::Header*>(binary.data());
+	const auto* phdr = reinterpret_cast<const Elf::ProgramHeader*>(
+		binary.data() + elf->e_phoff);
+
+	uint64_t bss_address = 0;
+	for (const auto* hdr = phdr; hdr < phdr + elf->e_phnum; hdr++) {
+		if (hdr->p_type == Elf::PT_LOAD &&
+			(hdr->p_flags & Elf::PF_W) != 0 && hdr->p_memsz > hdr->p_filesz)
+		{
+			bss_address = hdr->p_vaddr + hdr->p_memsz - 1;
+			break;
+		}
+	}
+	REQUIRE(bss_address != 0);
+
+	// Force demand paging instead of relying on the flat arena. The last BSS
+	// page has no bytes in the ELF file, but must be zero-filled and writable.
+	riscv::Machine<RISCV64> machine { binary, {
+		.memory_max = MAX_MEMORY,
+		.use_memory_arena = false,
+	} };
+	REQUIRE(machine.memory.read<uint8_t>(bss_address) == 0);
+	machine.memory.write<uint8_t>(bss_address, 0x5A);
+	REQUIRE(machine.memory.read<uint8_t>(bss_address) == 0x5A);
+}
+#endif
+
+#ifdef RISCV_VIRTUAL_PAGING
+TEST_CASE("Dynamic ELF auxiliary vector uses mapped image", "[Verify]")
+{
+	auto binary = load_file(cwd + "/elf/newlib-rv64gb-hello-world");
+	using Elf = riscv::Elf<RISCV64>;
+	auto* elf = reinterpret_cast<Elf::Header*>(binary.data());
+	elf->e_type = Elf::Header::ET_DYN;
+
+	riscv::Machine<RISCV64> machine { binary, {
+		.memory_max = MAX_MEMORY,
+		.use_memory_arena = false,
+	} };
+	machine.setup_linux({"loader"}, {});
+
+	using addr_t = riscv::address_type<RISCV64>;
+	addr_t cursor = machine.cpu.reg(REG_SP);
+	const auto argc = machine.memory.read<addr_t>(cursor);
+	cursor += sizeof(addr_t) * (1 + argc + 1);
+	while (machine.memory.read<addr_t>(cursor) != 0)
+		cursor += sizeof(addr_t);
+	cursor += sizeof(addr_t);
+
+	constexpr addr_t AT_PHDR_ID = 3;
+	constexpr addr_t AT_BASE_ID = 7;
+	addr_t at_phdr = 0;
+	addr_t at_base = 0;
+	while (const auto type = machine.memory.read<addr_t>(cursor)) {
+		const auto value = machine.memory.read<addr_t>(cursor + sizeof(addr_t));
+		if (type == AT_PHDR_ID)
+			at_phdr = value;
+		if (type == AT_BASE_ID)
+			at_base = value;
+		cursor += 2 * sizeof(addr_t);
+	}
+
+	addr_t expected_phdr = 0;
+	const auto* phdr = reinterpret_cast<const Elf::ProgramHeader*>(
+		binary.data() + elf->e_phoff);
+	for (const auto* hdr = phdr; hdr < phdr + elf->e_phnum; hdr++) {
+		if (hdr->p_type == Elf::PT_LOAD && hdr->p_offset <= elf->e_phoff &&
+			elf->e_phoff + elf->e_phnum * elf->e_phentsize <= hdr->p_offset + hdr->p_filesz)
+		{
+			expected_phdr = machine.memory.elf_base_address(
+				hdr->p_vaddr + elf->e_phoff - hdr->p_offset);
+		}
+	}
+	REQUIRE(at_phdr == expected_phdr);
+	REQUIRE(at_base == riscv::Memory<RISCV64>::DYLINK_BASE);
+	REQUIRE(at_base == machine.memory.elf_base_address(0));
+}
+#endif
+
 TEST_CASE("RV32 Newlib with B-ext Hello World", "[Verify]")
 {
 	const auto binary = load_file(cwd + "/elf/newlib-rv32gb-hello-world");

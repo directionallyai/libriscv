@@ -204,6 +204,26 @@ namespace riscv
 			}
 		}
 		if (phdr_location == 0) {
+			// PT_PHDR is optional. If the program-header table is covered by
+			// a loadable segment, AT_PHDR must point into the mapped ELF image.
+			// Dynamic linkers use this to distinguish being invoked directly
+			// from having been entered as an interpreter for another program.
+			const uint64_t phdr_begin = binary_ehdr->e_phoff;
+			const uint64_t phdr_size = uint64_t(phdr_count) * sizeof(*binary_phdr);
+			const uint64_t phdr_end = phdr_begin + phdr_size;
+			for (int i = 0; i < phdr_count; i++) {
+				const auto& phd = binary_phdr[i];
+				const uint64_t segment_end = uint64_t(phd.p_offset) + uint64_t(phd.p_filesz);
+				if (phd.p_type == Elf<W>::PT_LOAD && phd.p_offset <= phdr_begin &&
+					phdr_end >= phdr_begin && segment_end >= phd.p_offset && phdr_end <= segment_end)
+				{
+					phdr_location = this->memory.elf_base_address(
+						phd.p_vaddr + address_type<W>(phdr_begin - phd.p_offset));
+					break;
+				}
+			}
+		}
+		if (phdr_location == 0) {
 			for (int i = phdr_count-1; i >= 0; i--)
 			{
 				const auto* phd = &binary_phdr[i];
@@ -241,7 +261,9 @@ namespace riscv
 		push_aux<W>(argv, {AT_PHNUM, unsigned(phdr_count)});
 
 		// Misc
-		push_aux<W>(argv, {AT_BASE, address_type<W>(this->memory.start_address() & ~0xFFFFFFLL)});
+		const address_type<W> interpreter_base = this->memory.is_dynamic_executable()
+			? this->memory.elf_base_address(0) : 0;
+		push_aux<W>(argv, {AT_BASE, interpreter_base});
 		push_aux<W>(argv, {AT_ENTRY, this->memory.start_address()});
 		push_aux<W>(argv, {AT_HWCAP, 0});
 		push_aux<W>(argv, {AT_HWCAP2, 0});

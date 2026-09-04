@@ -262,6 +262,10 @@ namespace riscv
 	{
 		const auto* src = m_binary.data() + hdr->p_offset;
 		const size_t len = hdr->p_filesz;
+		const size_t memlen = hdr->p_memsz;
+		if (memlen < len) {
+			throw MachineException(INVALID_PROGRAM, "ELF segment file size exceeds memory size");
+		}
 		if (m_binary.size() <= hdr->p_offset ||
 			hdr->p_offset + len < hdr->p_offset)
 		{
@@ -270,7 +274,7 @@ namespace riscv
 		if (m_binary.size() < hdr->p_offset + len) {
 			throw MachineException(INVALID_PROGRAM, "Not enough room for ELF program segment");
 		}
-		if (vaddr + len < vaddr) {
+		if (vaddr + memlen < vaddr) {
 			throw MachineException(INVALID_PROGRAM, "Bogus ELF segment virtual base");
 		}
 
@@ -278,9 +282,8 @@ namespace riscv
 		printf("* Loading program of size %zu from %p to virtual %p -> %p\n",
 				len, src, (void*)uintptr_t(vaddr), (void*)uintptr_t(vaddr + len));
 		}
-		// Serialize pages cannot be called with len == 0,
-		// and there is nothing further to do.
-		if (UNLIKELY(len == 0))
+		// There is nothing to load or map for an empty segment.
+		if (UNLIKELY(memlen == 0))
 			return;
 
 		// segment permissions
@@ -313,7 +316,7 @@ namespace riscv
 
 		if constexpr (!virtual_paging_enabled) {
 			// Write directly to the arena (rodata boundary set after copy)
-			if (UNLIKELY(vaddr + len > memory_arena_size()))
+			if (UNLIKELY(vaddr + memlen > memory_arena_size()))
 				throw MachineException(INVALID_PROGRAM, "ELF segment exceeds arena size");
 			// A shared image already holds the bytes below its end, read-only
 			const address_t shared_end = this->shared_rodata_end();
@@ -322,8 +325,10 @@ namespace riscv
 			if (skip < len)
 				std::memcpy(&((char*)m_arena.data)[vaddr + skip], src + skip, len - skip);
 		} else {
-			// Load into virtual memory
-			this->memcpy(vaddr, src, len);
+			// Load the file-backed part into virtual memory. Pages in the
+			// remaining p_memsz range are demand-zeroed by the page table.
+			if (len != 0)
+				this->memcpy(vaddr, src, len);
 		}
 
 		// Track rodata boundary (set after memcpy so arena writes succeed)
@@ -333,11 +338,13 @@ namespace riscv
 		}
 
 		if (options.protect_segments) {
-			this->set_page_attr(vaddr, len, attr);
+			// p_memsz includes the zero-filled BSS tail. It needs the same
+			// permissions as the file-backed part of the PT_LOAD segment.
+			this->set_page_attr(vaddr, memlen, attr);
 		}
 		else {
 			// this might help execute simplistic barebones programs
-			this->set_page_attr(vaddr, len, {
+			this->set_page_attr(vaddr, memlen, {
 				 .read = true, .write = true, .exec = true
 			});
 		}

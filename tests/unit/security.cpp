@@ -2,6 +2,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <libriscv/machine.hpp>
+#include <algorithm>
 #include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
@@ -344,3 +345,63 @@ TEST_CASE("C7: pselect returns 0 without file descriptors", "[Security]")
 }
 
 
+
+// getdents64 must honor the guest-provided buffer length. Ignoring it lets a
+// host directory read overwrite adjacent guest memory.
+TEST_CASE("getdents64 respects guest buffer length", "[Security]")
+{
+	const auto binary = load_file(cwd + "/elf/newlib-rv64gb-hello-world");
+	riscv::Machine<RISCV64> machine { binary, { .memory_max = MAX_MEMORY } };
+	machine.setup_linux_syscalls(true, false);
+	machine.fds().proxy_mode = true;
+
+	const int real_fd = ::open(cwd.c_str(), O_RDONLY | O_DIRECTORY);
+	REQUIRE(real_fd >= 0);
+	const int guest_fd = machine.fds().assign_file(real_fd);
+	REQUIRE(guest_fd >= 0);
+
+	constexpr size_t requested = 32;
+	constexpr size_t allocation = 4096;
+	const auto buf = machine.memory.mmap_allocate(allocation);
+	std::vector<uint8_t> sentinel(allocation, 0xA5);
+	machine.memory.memcpy(buf, sentinel.data(), sentinel.size());
+
+	auto& cpu = machine.cpu;
+	cpu.reg(riscv::REG_ARG0) = guest_fd;
+	cpu.reg(riscv::REG_ARG1) = buf;
+	cpu.reg(riscv::REG_ARG2) = requested;
+	machine.system_call(61);
+
+	std::vector<uint8_t> result(allocation);
+	machine.memory.memcpy_out(result.data(), buf, result.size());
+	REQUIRE(std::all_of(result.begin() + requested, result.end(),
+		[](uint8_t byte) { return byte == 0xA5; }));
+}
+
+
+#if defined(FIOCLEX) && defined(FIONCLEX)
+TEST_CASE("ioctl supports close-on-exec requests in proxy mode", "[Security]")
+{
+	const auto binary = load_file(cwd + "/elf/newlib-rv64gb-hello-world");
+	riscv::Machine<RISCV64> machine { binary, { .memory_max = MAX_MEMORY } };
+	machine.setup_linux_syscalls(true, false);
+	machine.fds().proxy_mode = true;
+
+	const int real_fd = ::open(cwd.c_str(), O_RDONLY | O_DIRECTORY);
+	REQUIRE(real_fd >= 0);
+	const int guest_fd = machine.fds().assign_file(real_fd);
+
+	auto& cpu = machine.cpu;
+	cpu.reg(riscv::REG_ARG0) = guest_fd;
+	cpu.reg(riscv::REG_ARG1) = FIOCLEX;
+	cpu.reg(riscv::REG_ARG2) = 0;
+	machine.system_call(29);
+	REQUIRE(machine.return_value<int>() == 0);
+	REQUIRE((::fcntl(real_fd, F_GETFD) & FD_CLOEXEC) != 0);
+
+	cpu.reg(riscv::REG_ARG1) = FIONCLEX;
+	machine.system_call(29);
+	REQUIRE(machine.return_value<int>() == 0);
+	REQUIRE((::fcntl(real_fd, F_GETFD) & FD_CLOEXEC) == 0);
+}
+#endif
