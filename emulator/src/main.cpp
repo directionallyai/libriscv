@@ -426,7 +426,7 @@ static void run_program(
 		machine.setup_linux_syscalls();
 		machine.fds().permit_filesystem = !cli_args.sandbox;
 		if (erofs) setup_erofs_syscalls(machine, erofs_runtime);
-		machine.fds().permit_sockets    = !erofs && !cli_args.sandbox;
+		machine.fds().permit_sockets    = !cli_args.sandbox;
 		if (cli_args.proxy_mode) {
 			if (cli_args.sandbox)
 				fprintf(stderr, "Warning: Proxy mode is enabled, but sandbox is also enabled\n");

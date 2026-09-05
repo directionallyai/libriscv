@@ -228,7 +228,7 @@ static int open_sealed_data(std::string_view name, std::string_view data) {
 }
 
 template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRuntime<W>& runtime) {
-	using Machine=riscv::Machine<W>; machine.fds().permit_filesystem=false; machine.fds().permit_sockets=false;
+	using Machine=riscv::Machine<W>; machine.fds().permit_filesystem=false; machine.fds().permit_sockets=true;
 	machine.fds().cwd="/"; machine.set_userdata(&runtime);
 	machine.fds().direct_mmap = [fs=runtime.fs, &runtime](int vfd, uint64_t offset, size_t length) {
 		auto it = runtime.paths.find(vfd);
