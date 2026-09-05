@@ -2,6 +2,8 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <cstddef>
+#include <cstdint>
 #include "../types.hpp"
 
 #if defined(__APPLE__) || defined(__LINUX__)
@@ -12,6 +14,10 @@ namespace riscv {
 
 struct FileDescriptors
 {
+	struct DirectFileMapping {
+		const uint8_t* data = nullptr;
+		size_t size = 0;
+	};
 #ifdef _WIN32
     typedef uint64_t real_fd_type; // SOCKET is uint64_t
 #else
@@ -54,6 +60,9 @@ struct FileDescriptors
 	std::function<bool(void*, std::string&)> filter_readlink = nullptr; /* NOTE: Can modify path */
 	std::function<bool(void*, const std::string&)> filter_stat = nullptr;
 	std::function<bool(void*, uint64_t)> filter_ioctl = nullptr;
+	// Optional immutable file-image mapping. Returning a page-aligned host
+	// pointer lets mmap install non-owning pages instead of copying file data.
+	std::function<DirectFileMapping(int, uint64_t, size_t)> direct_mmap = nullptr;
 };
 
 inline int FileDescriptors::assign(FileDescriptors::real_fd_type real_fd, bool socket)

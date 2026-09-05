@@ -40,11 +40,15 @@ public:
 	std::vector<DirEntry> read_dir(std::string_view path) const;
 	std::string read_link(std::string_view path) const;
 	int open_sealed(std::string_view path) const;
+	riscv::FileDescriptors::DirectFileMapping map_extent(
+		std::string_view path, uint64_t offset, size_t length) const;
 
 private:
 	static std::string normalize(std::string_view path);
 	erofs_inode inode(std::string_view path) const;
 	mutable erofs_sb_info m_sbi {};
+	void* m_image = nullptr;
+	size_t m_image_size = 0;
 	bool m_open = false;
 };
 

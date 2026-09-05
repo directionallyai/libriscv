@@ -27,14 +27,67 @@ ErofsFilesystem::ErofsFilesystem(const std::string& image)
 		m_open = false;
 		throw std::runtime_error("Could not read EROFS superblock: " + std::string(std::strerror(-err)));
 	}
+	struct stat st {};
+	if (::fstat(m_sbi.bdev.fd, &st) < 0)
+		throw std::runtime_error("Could not stat EROFS image: " + std::string(std::strerror(errno)));
+	m_image_size = st.st_size;
+	m_image = ::mmap(nullptr, m_image_size, PROT_READ, MAP_PRIVATE, m_sbi.bdev.fd, 0);
+	if (m_image == MAP_FAILED) {
+		m_image = nullptr;
+		throw std::runtime_error("Could not mmap EROFS image: " + std::string(std::strerror(errno)));
+	}
 }
 
 ErofsFilesystem::~ErofsFilesystem()
 {
 	if (m_open) {
+		if (m_image != nullptr)
+			::munmap(m_image, m_image_size);
 		erofs_put_super(&m_sbi);
 		erofs_dev_close(&m_sbi);
 	}
+}
+
+riscv::FileDescriptors::DirectFileMapping ErofsFilesystem::map_extent(
+	std::string_view path, uint64_t offset, size_t length) const
+{
+	auto ino = inode(path);
+	if (S_ISLNK(ino.i_mode)) {
+		const auto current = normalize(path);
+		auto target = read_link(path);
+		if (target.empty() || target.front() != '/') {
+			const auto slash = current.rfind('/');
+			target = current.substr(0, slash + 1) + target;
+		}
+		return map_extent(target, offset, length);
+	}
+	if (!S_ISREG(ino.i_mode) || m_image == nullptr || length == 0 ||
+		(offset & (riscv::Page::size() - 1)) != 0 ||
+		(length & (riscv::Page::size() - 1)) != 0 ||
+		offset > ino.i_size ||
+		erofs_inode_is_data_compressed(ino.datalayout))
+		return {};
+	const size_t available = std::min<uint64_t>(length, ino.i_size - offset) &
+		~size_t(riscv::Page::size() - 1);
+	if (available == 0)
+		return {};
+
+	struct erofs_map_blocks map {};
+	map.buf = __EROFS_BUF_INITIALIZER;
+	map.m_la = offset;
+	if (erofs_map_blocks(&ino, &map, 0) != 0 ||
+		(map.m_flags & EROFS_MAP_MAPPED) == 0 ||
+		(map.m_flags & (EROFS_MAP_META | __EROFS_MAP_FRAGMENT)) != 0 ||
+		map.m_la > offset || offset - map.m_la >= map.m_llen ||
+		available > map.m_llen - (offset - map.m_la))
+		return {};
+
+	struct erofs_map_dev device {map.m_pa + offset - map.m_la, map.m_deviceid};
+	if (erofs_map_dev(&m_sbi, &device) != 0 || device.m_deviceid != 0 ||
+		(device.m_pa & (riscv::Page::size() - 1)) != 0 ||
+		device.m_pa > m_image_size || available > m_image_size - device.m_pa)
+		return {};
+	return {static_cast<const uint8_t*>(m_image) + device.m_pa, available};
 }
 
 std::string ErofsFilesystem::normalize(std::string_view path)
@@ -156,6 +209,12 @@ static int error_code(const std::exception& e) {
 template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRuntime<W>& runtime) {
 	using Machine=riscv::Machine<W>; machine.fds().permit_filesystem=false; machine.fds().permit_sockets=false;
 	machine.fds().cwd="/"; machine.set_userdata(&runtime);
+	machine.fds().direct_mmap = [fs=runtime.fs, &runtime](int vfd, uint64_t offset, size_t length) {
+		auto it = runtime.paths.find(vfd);
+		return it == runtime.paths.end()
+			? riscv::FileDescriptors::DirectFileMapping{}
+			: fs->map_extent(it->second, offset, length);
+	};
 	Machine::install_syscall_handler(56, [](Machine& m) {
 		auto& rt=*m.template get_userdata<ErofsRuntime<W>>(); int dirfd=m.template sysarg<int>(0);
 		std::string path=m.memory.memstring(m.sysarg(1)); int flags=m.template sysarg<int>(2);

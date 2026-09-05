@@ -77,12 +77,28 @@ static void add_mman_syscalls()
 						MMAP_HAS_FAILED();
 					dst = addr_g;
 				}
+				if constexpr (virtual_paging_enabled) if (machine.fds().direct_mmap != nullptr &&
+					!attr.write) {
+					const auto direct = machine.fds().direct_mmap(vfd, voff, length);
+					if (direct.data != nullptr && direct.size == length) {
+						// mmap replaces any pages already present in the selected range.
+						// This matters for overlapping PT_LOAD mappings used by musl.
+						machine.memory.free_pages(dst, direct.size);
+						machine.memory.insert_non_owned_memory(
+							dst, const_cast<uint8_t*>(direct.data), direct.size, attr);
+						SYSPRINT("<<< mmap direct immutable image (%zu pages) = 0x%lX\n",
+							(size_t)(direct.size / Page::size()), (long)dst);
+						machine.set_result(dst);
+						return;
+					}
+				}
 				// Make the area read-write
 				machine.memory.set_page_attr(dst, length, PageAttributes{});
 				// Readv into the area
 				std::array<riscv::vBuffer, 256> buffers;
 				const size_t cnt =
-					machine.memory.gather_writable_buffers_from_range(buffers.size(), buffers.data(), dst, length);
+					machine.memory.gather_writable_buffers_from_range(
+						buffers.size(), buffers.data(), dst, length);
 				// Seek to the given offset in the file and read the contents into guest memory
 #ifdef _WIN32
 				if (_lseek(real_fd, voff, SEEK_SET) == -1L)
