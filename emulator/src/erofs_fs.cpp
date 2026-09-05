@@ -48,7 +48,7 @@ ErofsFilesystem::~ErofsFilesystem()
 	}
 }
 
-riscv::FileDescriptors::DirectFileMapping ErofsFilesystem::map_extent(
+std::vector<riscv::FileDescriptors::DirectFileMapping> ErofsFilesystem::map_extents(
 	std::string_view path, uint64_t offset, size_t length) const
 {
 	auto ino = inode(path);
@@ -59,7 +59,7 @@ riscv::FileDescriptors::DirectFileMapping ErofsFilesystem::map_extent(
 			const auto slash = current.rfind('/');
 			target = current.substr(0, slash + 1) + target;
 		}
-		return map_extent(target, offset, length);
+		return map_extents(target, offset, length);
 	}
 	if (!S_ISREG(ino.i_mode) || m_image == nullptr || length == 0 ||
 		(offset & (riscv::Page::size() - 1)) != 0 ||
@@ -72,22 +72,31 @@ riscv::FileDescriptors::DirectFileMapping ErofsFilesystem::map_extent(
 	if (available == 0)
 		return {};
 
-	struct erofs_map_blocks map {};
-	map.buf = __EROFS_BUF_INITIALIZER;
-	map.m_la = offset;
-	if (erofs_map_blocks(&ino, &map, 0) != 0 ||
-		(map.m_flags & EROFS_MAP_MAPPED) == 0 ||
-		(map.m_flags & (EROFS_MAP_META | __EROFS_MAP_FRAGMENT)) != 0 ||
-		map.m_la > offset || offset - map.m_la >= map.m_llen ||
-		available > map.m_llen - (offset - map.m_la))
-		return {};
+	std::vector<riscv::FileDescriptors::DirectFileMapping> extents;
+	uint64_t logical = offset;
+	const uint64_t end = offset + available;
+	while (logical < end) {
+		struct erofs_map_blocks map {};
+		map.buf = __EROFS_BUF_INITIALIZER;
+		map.m_la = logical;
+		if (erofs_map_blocks(&ino, &map, 0) != 0 ||
+			(map.m_flags & EROFS_MAP_MAPPED) == 0 ||
+			(map.m_flags & (EROFS_MAP_META | __EROFS_MAP_FRAGMENT)) != 0 ||
+			map.m_la > logical || logical - map.m_la >= map.m_llen)
+			return {};
 
-	struct erofs_map_dev device {map.m_pa + offset - map.m_la, map.m_deviceid};
-	if (erofs_map_dev(&m_sbi, &device) != 0 || device.m_deviceid != 0 ||
-		(device.m_pa & (riscv::Page::size() - 1)) != 0 ||
-		device.m_pa > m_image_size || available > m_image_size - device.m_pa)
-		return {};
-	return {static_cast<const uint8_t*>(m_image) + device.m_pa, available};
+		const size_t run = std::min<uint64_t>(end - logical,
+			map.m_llen - (logical - map.m_la)) & ~size_t(riscv::Page::size() - 1);
+		struct erofs_map_dev device {map.m_pa + logical - map.m_la, map.m_deviceid};
+		if (run == 0 || erofs_map_dev(&m_sbi, &device) != 0 || device.m_deviceid != 0 ||
+			(device.m_pa & (riscv::Page::size() - 1)) != 0 ||
+			device.m_pa > m_image_size || run > m_image_size - device.m_pa)
+			return {};
+		extents.push_back({size_t(logical - offset),
+			static_cast<const uint8_t*>(m_image) + device.m_pa, run});
+		logical += run;
+	}
+	return extents;
 }
 
 std::string ErofsFilesystem::normalize(std::string_view path)
@@ -204,6 +213,18 @@ static GuestStat guest_stat(const ErofsFilesystem::Node& n) {
 static int error_code(const std::exception& e) {
 	if (auto* se=dynamic_cast<const std::system_error*>(&e)) return -se->code().value(); return -EIO;
 }
+static int open_sealed_data(std::string_view name, std::string_view data) {
+	int fd = memfd_create(name.data(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	if (fd < 0) return -errno;
+	if (!data.empty() && ::write(fd, data.data(), data.size()) != ssize_t(data.size())) {
+		const int err = errno; ::close(fd); return -err;
+	}
+	if (lseek(fd, 0, SEEK_SET) < 0 || fcntl(fd, F_ADD_SEALS,
+		F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0) {
+		const int err = errno; ::close(fd); return -err;
+	}
+	return fd;
+}
 }
 
 template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRuntime<W>& runtime) {
@@ -212,8 +233,8 @@ template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRunt
 	machine.fds().direct_mmap = [fs=runtime.fs, &runtime](int vfd, uint64_t offset, size_t length) {
 		auto it = runtime.paths.find(vfd);
 		return it == runtime.paths.end()
-			? riscv::FileDescriptors::DirectFileMapping{}
-			: fs->map_extent(it->second, offset, length);
+			? std::vector<riscv::FileDescriptors::DirectFileMapping>{}
+			: fs->map_extents(it->second, offset, length);
 	};
 	Machine::install_syscall_handler(56, [](Machine& m) {
 		auto& rt=*m.template get_userdata<ErofsRuntime<W>>(); int dirfd=m.template sysarg<int>(0);
@@ -223,6 +244,21 @@ template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRunt
 		if (path.front()!='/') { if (dirfd==AT_FDCWD) path=join_path(m.fds().cwd,path);
 			else if (auto i=rt.paths.find(dirfd);i!=rt.paths.end()) path=join_path(i->second,path);
 			else { m.set_result(-EBADF); return; } }
+		if (path == "/dev/ready") {
+			if (!rt.ready_reported) {
+				const auto elapsed = std::chrono::duration<double, std::milli>(
+					std::chrono::steady_clock::now() - rt.started_at).count();
+				printf("Ready: %.3f ms\n", elapsed);
+				fflush(stdout);
+				rt.ready_reported = true;
+			}
+			const int realfd = open_sealed_data("rvlinux-ready", "ok\n");
+			if (realfd < 0) { m.set_result(realfd); return; }
+			const int vfd = m.fds().assign_file(realfd);
+			rt.paths.emplace(vfd, path);
+			m.set_result(vfd);
+			return;
+		}
 		try { auto node=rt.fs->lookup(path); int realfd;
 			if (S_ISDIR(node.mode)) realfd=::open("/dev/null",O_RDONLY|O_CLOEXEC);
 			else if (S_ISREG(node.mode) || S_ISLNK(node.mode)) realfd=rt.fs->open_sealed(path); else { m.set_result(-ENXIO); return; }

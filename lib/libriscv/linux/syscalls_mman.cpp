@@ -77,22 +77,27 @@ static void add_mman_syscalls()
 						MMAP_HAS_FAILED();
 					dst = addr_g;
 				}
+				// MAP_FIXED replaces all existing mappings in the requested range.
+				// In particular, a dynamic loader can overlap a writable PT_LOAD
+				// segment with an earlier immutable direct mapping.
+				if constexpr (virtual_paging_enabled) if ((flags & LINUX_MAP_FIXED) != 0)
+					machine.memory.free_pages(dst, length);
+				std::vector<FileDescriptors::DirectFileMapping> direct;
 				if constexpr (virtual_paging_enabled) if (machine.fds().direct_mmap != nullptr &&
-					!attr.write) {
-					const auto direct = machine.fds().direct_mmap(vfd, voff, length);
-					if (direct.data != nullptr && direct.size == length) {
-						// mmap replaces any pages already present in the selected range.
-						// This matters for overlapping PT_LOAD mappings used by musl.
-						machine.memory.free_pages(dst, direct.size);
-						machine.memory.insert_non_owned_memory(
-							dst, const_cast<uint8_t*>(direct.data), direct.size, attr);
-						SYSPRINT("<<< mmap direct immutable image (%zu pages) = 0x%lX\n",
-							(size_t)(direct.size / Page::size()), (long)dst);
-						machine.set_result(dst);
-						return;
+					!attr.write)
+					direct = machine.fds().direct_mmap(vfd, voff, length);
+				if constexpr (virtual_paging_enabled) {
+					size_t previous_end = 0;
+					for (const auto& extent : direct) {
+						if (extent.offset < previous_end || extent.data == nullptr || extent.size == 0 ||
+							extent.offset > length || extent.size > length - extent.offset) {
+							direct.clear();
+							break;
+						}
+						previous_end = extent.offset + extent.size;
 					}
 				}
-				// Make the area read-write
+				// No usable direct extents: use the generic file-backed mmap path.
 				machine.memory.set_page_attr(dst, length, PageAttributes{});
 				// Readv into the area
 				std::array<riscv::vBuffer, 256> buffers;
@@ -120,6 +125,17 @@ static void add_mman_syscalls()
 #endif
 				// Set new page protections on area
 				machine.memory.set_page_attr(dst, length, attr);
+				if constexpr (virtual_paging_enabled) if (!direct.empty()) {
+					size_t pages = 0;
+					for (const auto& extent : direct) {
+						machine.memory.free_pages(dst + extent.offset, extent.size);
+						machine.memory.insert_non_owned_memory(dst + extent.offset,
+							const_cast<uint8_t*>(extent.data), extent.size, attr);
+						pages += extent.size / Page::size();
+					}
+					SYSPRINT("<<< mmap direct immutable image (%zu pages in %zu extents) = 0x%lX\n",
+						pages, direct.size(), (long)dst);
+				}
 				machine.set_result(dst);
 				return;
 			}

@@ -4,6 +4,7 @@
 #include <map>
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 #include "../types.hpp"
 
 #if defined(__APPLE__) || defined(__LINUX__)
@@ -15,6 +16,7 @@ namespace riscv {
 struct FileDescriptors
 {
 	struct DirectFileMapping {
+		size_t offset = 0;
 		const uint8_t* data = nullptr;
 		size_t size = 0;
 	};
@@ -62,7 +64,7 @@ struct FileDescriptors
 	std::function<bool(void*, uint64_t)> filter_ioctl = nullptr;
 	// Optional immutable file-image mapping. Returning a page-aligned host
 	// pointer lets mmap install non-owning pages instead of copying file data.
-	std::function<DirectFileMapping(int, uint64_t, size_t)> direct_mmap = nullptr;
+	std::function<std::vector<DirectFileMapping>(int, uint64_t, size_t)> direct_mmap = nullptr;
 };
 
 inline int FileDescriptors::assign(FileDescriptors::real_fd_type real_fd, bool socket)

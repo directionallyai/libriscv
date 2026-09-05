@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -40,7 +41,7 @@ public:
 	std::vector<DirEntry> read_dir(std::string_view path) const;
 	std::string read_link(std::string_view path) const;
 	int open_sealed(std::string_view path) const;
-	riscv::FileDescriptors::DirectFileMapping map_extent(
+	std::vector<riscv::FileDescriptors::DirectFileMapping> map_extents(
 		std::string_view path, uint64_t offset, size_t length) const;
 
 private:
@@ -54,6 +55,8 @@ private:
 
 template <int W> struct ErofsRuntime {
 	std::shared_ptr<ErofsFilesystem> fs;
+	std::chrono::steady_clock::time_point started_at = std::chrono::steady_clock::now();
+	bool ready_reported = false;
 	riscv::address_type<W> symbol_function = 0;
 	struct OpenDirectory {
 		std::string path;

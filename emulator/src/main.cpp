@@ -597,6 +597,7 @@ static void run_program(
 	}
 
 	auto t0 = std::chrono::high_resolution_clock::now();
+	erofs_runtime.started_at = std::chrono::steady_clock::now();
 	try {
 		// If you run the emulator with --gdb or GDB=1, you can connect
 		// with gdb-multiarch using target remote localhost:2159.
