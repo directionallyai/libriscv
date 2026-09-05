@@ -334,7 +334,29 @@ static void run_program(
 		.libc_fastpath = cli_args.libc_fastpath,
 #ifdef RISCV_BINARY_TRANSLATION
 		.translate_enabled = !cli_args.no_translate,
-		.translate_future_segments = cli_args.proxy_mode && cli_args.translate_future,
+		// EROFS mode too, not just --proxy: unlike --proxy, EROFS doesn't
+		// disable sandboxing (translate_unsafe_remove_checks below stays
+		// tied to proxy_mode alone) -- the guest filesystem stays fully
+		// read-only and image-scoped either way, so there's no reason a
+		// non-initial segment (e.g. a shared library loaded after the
+		// main executable) should be ineligible for translation just
+		// because this is --erofs rather than --proxy. Confirmed live
+		// with --verbose: without this, a non-initial segment (in one
+		// real case, a CPython libpython.so) was never even considered
+		// for translation under --erofs, regardless of --no-translate.
+		// Note this doesn't mean every --erofs guest gets faster this
+		// way -- confirmed live, in that same CPython case, translation
+		// activated correctly (real "Emitted N accelerated instructions"
+		// output) but produced no measurable speedup, because CPython's
+		// own opcode dispatch loop is computed-goto/indirect-jump-heavy,
+		// a shape this translator can only resolve through its own
+		// jump-target table rather than a direct native branch -- a
+		// known general limitation for interpreter dispatch loops
+		// specifically, not particular to this flag or to EROFS mode.
+		// This still matters for straight-line/loop-heavy guest code
+		// living in a non-initial segment, which is the common case this
+		// flag exists for in the first place.
+		.translate_future_segments = (cli_args.proxy_mode || !cli_args.erofs_image.empty()) && cli_args.translate_future,
 		.translate_trace = cli_args.trace,
 		.translate_timing = cli_args.timing,
 #endif
