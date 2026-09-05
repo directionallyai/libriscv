@@ -5,6 +5,7 @@
 #include <chrono>
 #include <thread>
 #include "settings.hpp"
+#include "erofs_fs.hpp"
 #if __has_include(<unistd.h>)
 #include <fcntl.h>
 #endif
@@ -49,6 +50,7 @@ struct Arguments {
 	std::string output_file;
 	std::string call_function;
 	std::string jump_hints_file;
+	std::string erofs_image;
 };
 
 #ifdef HAVE_GETOPT_LONG
@@ -90,6 +92,7 @@ static const struct option long_options[] = {
 	{"libc-fastpath", no_argument, 0, 1006},
 	{"nbit-address-space", no_argument, 0, 1007},
 	{"block-split", required_argument, 0, 1008},
+	{"erofs", required_argument, 0, 1009},
 	{0, 0, 0, 0}
 };
 
@@ -129,6 +132,7 @@ static void print_help(const char* name)
 		"  -X, --execute-only Enforce execute-only segments (no read/write)\n"
 		"  -I, --ignore-text  Ignore .text section, and use segments only\n"
 		"  -c, --call func    Call a function after loading the program\n"
+		"      --erofs image    Use an EROFS image as a completely read-only guest root\n"
 		"      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations\n"
 		"      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them\n"
 		"\n"
@@ -219,6 +223,7 @@ static int parse_arguments(int argc, const char** argv, Arguments& args)
 			case 1006: args.libc_fastpath = true; break;
 			case 1007: args.automatic_nbit = true; break;
 			case 1008: args.block_split = atoi(optarg); break;
+			case 1009: args.erofs_image = optarg; break;
 			case 'm': // --memory
 				if (optarg) {
 					char* endptr;
@@ -292,7 +297,8 @@ static void run_program(
 	const Arguments& cli_args,
 	const std::string_view binary,
 	const bool is_dynamic,
-	const std::vector<std::string>& args)
+	const std::vector<std::string>& args,
+	const std::shared_ptr<ErofsFilesystem>& erofs)
 {
 	if (cli_args.mingw && (!riscv::binary_translation_enabled || riscv::libtcc_enabled)) {
 		fprintf(stderr, "Error: Full binary translation must be enabled for MinGW cross-compilation\n");
@@ -392,13 +398,13 @@ static void run_program(
 
 	// A helper system call to ask for symbols that is possibly only known at runtime
 	// Used by testing executables
-	riscv::address_type<W> symbol_function = 0;
-	machine.set_userdata(&symbol_function);
+	ErofsRuntime<W> erofs_runtime {erofs};
+	machine.set_userdata(&erofs_runtime);
 	machine.install_syscall_handler(500,
 		[] (auto& machine) {
 			auto [addr] = machine.template sysargs<riscv::address_type<W>>();
-			auto& symfunc = *machine.template get_userdata<decltype(symbol_function)>();
-			symfunc = addr;
+			auto& state = *machine.template get_userdata<ErofsRuntime<W>>();
+			state.symbol_function = addr;
 			printf("Introduced to symbol function: 0x%" PRIX64 "\n", uint64_t(addr));
 		});
 
@@ -419,7 +425,8 @@ static void run_program(
 		// Linux system to open files and access internet
 		machine.setup_linux_syscalls();
 		machine.fds().permit_filesystem = !cli_args.sandbox;
-		machine.fds().permit_sockets    = !cli_args.sandbox;
+		if (erofs) setup_erofs_syscalls(machine, erofs_runtime);
+		machine.fds().permit_sockets    = !erofs && !cli_args.sandbox;
 		if (cli_args.proxy_mode) {
 			if (cli_args.sandbox)
 				fprintf(stderr, "Warning: Proxy mode is enabled, but sandbox is also enabled\n");
@@ -665,8 +672,20 @@ static void run_program(
 		else
 		printf("Runtime: %.3fms   (Use --accurate for instruction counting)\n",
 			runtime.count()*1000.0);
-		printf("Pages in use: %zu (%" PRIu64 " kB virtual memory, total %" PRIu64 " kB)\n",
-			machine.memory.pages_active(),
+		size_t readonly_pages = 0;
+		size_t executable_pages = 0;
+		size_t writable_pages = 0;
+		for (const auto& [pageno, page] : machine.memory.pages()) {
+			(void)pageno;
+			if (page.attr.write)
+				writable_pages++;
+			else if (page.attr.read && page.attr.exec)
+				executable_pages++;
+			else if (page.attr.read)
+				readonly_pages++;
+		}
+		printf("Pages in use: %zu (r/o: %zu, r-x: %zu, r/w: %zu; %" PRIu64 " kB virtual memory, total %" PRIu64 " kB)\n",
+			machine.memory.pages_active(), readonly_pages, executable_pages, writable_pages,
 			machine.memory.pages_active() * riscv::Page::size() / uint64_t(1024),
 			machine.memory.memory_usage_total() / uint64_t(1024));
 	}
@@ -674,8 +693,8 @@ static void run_program(
 	if (!cli_args.call_function.empty())
 	{
 		auto addr = machine.address_of(cli_args.call_function);
-		if (addr == 0 && symbol_function != 0) {
-			addr = machine.vmcall(symbol_function, cli_args.call_function);
+		if (addr == 0 && erofs_runtime.symbol_function != 0) {
+			addr = machine.vmcall(erofs_runtime.symbol_function, cli_args.call_function);
 		}
 		if (addr != 0) {
 			printf("Calling function %s @ 0x%lX\n", cli_args.call_function.c_str(), long(addr));
@@ -749,39 +768,31 @@ int main(int argc, const char** argv)
 	using ElfHeader = typename riscv::Elf<4>::Header;
 
 	try {
+		if (!cli_args.erofs_image.empty() && cli_args.proxy_mode)
+			throw std::runtime_error("--erofs and --proxy are mutually exclusive");
+		std::shared_ptr<ErofsFilesystem> erofs;
+		if (!cli_args.erofs_image.empty()) erofs = std::make_shared<ErofsFilesystem>(cli_args.erofs_image);
 		std::vector<uint8_t> vbin;
-#if !defined(__linux__)
-		// Use load_file for non-Posix systems
-		vbin = load_file(filename);
-		if (vbin.size() < sizeof(ElfHeader)) {
-			fprintf(stderr, "ELF binary was too small to be usable!\n");
-			exit(1);
-		}
-		std::string_view binary { (const char*)vbin.data(), vbin.size() };
-#else
-		// Use mmap for Posix systems, not sure if Apple supports this
 		std::string_view binary;
-		int fd = open(filename.c_str(), O_RDONLY);
-		if (fd < 0) {
-			fprintf(stderr, "Could not open file: %s\n", filename.c_str());
-			exit(1);
-		}
-		struct stat st;
-		if (fstat(fd, &st) < 0) {
-			fprintf(stderr, "Could not stat file: %s\n", filename.c_str());
-			exit(1);
-		}
-		if (st.st_size < sizeof(ElfHeader)) {
-			fprintf(stderr, "ELF binary was too small to be usable!\n");
-			exit(1);
-		}
-		void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_FILE|MAP_PRIVATE|MAP_NORESERVE, fd, 0);
-		if (ptr == MAP_FAILED) {
-			fprintf(stderr, "Could not mmap file: %s\n", filename.c_str());
-			exit(1);
-		}
-		binary = { (const char*)ptr, size_t(st.st_size) };
+		if (erofs) {
+			vbin = erofs->read_file(filename);
+			if (vbin.size() < sizeof(ElfHeader)) throw std::runtime_error("ELF binary was too small");
+			binary = {reinterpret_cast<const char*>(vbin.data()), vbin.size()};
+		} else {
+#if !defined(__linux__)
+			vbin = load_file(filename);
+			if (vbin.size() < sizeof(ElfHeader)) throw std::runtime_error("ELF binary was too small");
+			binary = {reinterpret_cast<const char*>(vbin.data()), vbin.size()};
+#else
+			int fd = open(filename.c_str(), O_RDONLY);
+			if (fd < 0) throw std::runtime_error("Could not open file: " + filename);
+			struct stat st;
+			if (fstat(fd, &st) < 0 || st.st_size < sizeof(ElfHeader)) throw std::runtime_error("Could not stat ELF: " + filename);
+			void* ptr = mmap(nullptr, st.st_size, PROT_READ, MAP_FILE|MAP_PRIVATE|MAP_NORESERVE, fd, 0);
+			if (ptr == MAP_FAILED) throw std::runtime_error("Could not mmap file: " + filename);
+			binary = {static_cast<const char*>(ptr), size_t(st.st_size)};
 #endif
+		}
 
 		bool is_dynamic = false;
 		if (binary[4] == riscv::ELFCLASS64) {
@@ -791,31 +802,30 @@ int main(int argc, const char** argv)
 
 			if (is_dynamic) {
 				// Load the dynamic linker shared object
-				if (interpreter.empty()) {
-					interpreter = DYNAMIC_LINKER;
-				}
+				const std::string interpreter_path = interpreter.empty()
+					? DYNAMIC_LINKER : std::string(interpreter);
 				try {
-					vbin = load_file(std::string(interpreter));
+					vbin = erofs ? erofs->read_file(interpreter_path) : load_file(interpreter_path);
 				} catch (const std::exception& e) {
-					vbin = load_file(DYNAMIC_LINKER);
+					vbin = erofs ? erofs->read_file(DYNAMIC_LINKER) : load_file(DYNAMIC_LINKER);
 				}
 				binary = { (const char*)vbin.data(), vbin.size() };
 				// Insert program name as argv[1]
 				args.insert(args.begin() + 1, args.at(0));
 				// Set dynamic linker to argv[0]
-				args.at(0) = interpreter;
+				args.at(0) = interpreter_path;
 			}
 		}
 
 		if (binary[4] == riscv::ELFCLASS64)
 #ifdef RISCV_64I
-			run_program<riscv::RISCV64> (cli_args, binary, is_dynamic, args);
+			run_program<riscv::RISCV64> (cli_args, binary, is_dynamic, args, erofs);
 #else
 			throw riscv::MachineException(riscv::FEATURE_DISABLED, "64-bit not currently enabled");
 #endif
 		else if (binary[4] == riscv::ELFCLASS32)
 #ifdef RISCV_32I
-			run_program<riscv::RISCV32> (cli_args, binary, is_dynamic, args);
+			run_program<riscv::RISCV32> (cli_args, binary, is_dynamic, args, erofs);
 #else
 			throw riscv::MachineException(riscv::FEATURE_DISABLED, "32-bit not currently enabled");
 #endif

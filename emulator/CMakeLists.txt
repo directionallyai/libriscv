@@ -116,3 +116,22 @@ endif()
 if (MICRO_EMULATOR)
 	add_emulator(rvmicro  EMULATOR_MODE_MICRO=1)
 endif()
+
+# rvlinux' optional image-root mode uses the pinned, MIT-licensed liberofs reader.
+include(ExternalProject)
+set(EROFS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/erofs-utils")
+set(EROFS_BINARY_DIR "${CMAKE_CURRENT_BINARY_DIR}/erofs-utils")
+ExternalProject_Add(liberofs_external
+	SOURCE_DIR "${EROFS_SOURCE_DIR}"
+	BINARY_DIR "${EROFS_BINARY_DIR}"
+	CONFIGURE_COMMAND /bin/sh -c "cd '${EROFS_SOURCE_DIR}' && ./autogen.sh && cd '${EROFS_BINARY_DIR}' && '${EROFS_SOURCE_DIR}/configure' --disable-lz4 --disable-lzma --disable-fuse --without-uuid --without-libcurl --without-openssl --without-libxml2 --without-libdeflate --without-libzstd"
+	BUILD_COMMAND ${CMAKE_MAKE_PROGRAM} -C lib
+	INSTALL_COMMAND ""
+	BUILD_BYPRODUCTS "${EROFS_BINARY_DIR}/lib/.libs/liberofs.a")
+add_library(liberofs STATIC IMPORTED GLOBAL)
+set_target_properties(liberofs PROPERTIES IMPORTED_LOCATION "${EROFS_BINARY_DIR}/lib/.libs/liberofs.a")
+add_dependencies(liberofs liberofs_external)
+target_sources(rvlinux PRIVATE src/erofs_fs.cpp)
+target_compile_definitions(rvlinux PRIVATE HAVE_CONFIG_H)
+target_include_directories(rvlinux PRIVATE "${EROFS_SOURCE_DIR}/include" "${EROFS_BINARY_DIR}")
+target_link_libraries(rvlinux liberofs pthread)

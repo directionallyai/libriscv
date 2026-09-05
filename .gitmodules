@@ -13,3 +13,6 @@
 [submodule "examples/wasm/program/LuaJIT"]
 	path = examples/wasm/program/LuaJIT
 	url = https://github.com/fwsGonzo/LuaJIT.git
+[submodule "emulator/third_party/erofs-utils"]
+	path = emulator/third_party/erofs-utils
+	url = https://github.com/erofs/erofs-utils.git
