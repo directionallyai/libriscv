@@ -408,8 +408,9 @@ static void run_program(
 			printf("Introduced to symbol function: 0x%" PRIX64 "\n", uint64_t(addr));
 		});
 
-	// Enable stdin when in proxy mode
-	if (cli_args.proxy_mode) {
+	// Proxy mode and image-root mode both intentionally expose the host's
+	// standard input stream. EROFS still controls pathname access separately.
+	if (cli_args.proxy_mode || erofs) {
 		machine.set_stdin(
 		[](const riscv::Machine<W> &machine, char *buf, size_t size) -> long {
 			return read(0, buf, size);
