@@ -51,6 +51,22 @@ struct Arguments {
 	std::string call_function;
 	std::string jump_hints_file;
 	std::string erofs_image;
+	// Re-run the same guest program this many extra times, in this same
+	// process, after the first run -- each run gets a genuinely fresh
+	// Machine and ErofsRuntime (run_program() constructs both itself,
+	// every call), so there is no state leaking between runs the way
+	// Machine::reset() alone would (Memory::reset() is a documented
+	// no-op -- "Hard to support because of things like serialization,
+	// machine options and machine forks" -- so reusing one Machine
+	// across runs of a real OS-interacting guest like CPython, which
+	// mutates heap/fd state and expects to exit exactly once, was never
+	// going to be safe). What DOES persist across runs here, unlike
+	// across separate process invocations of this same CLI, is whatever
+	// process-global state the binary translator itself keeps (the
+	// embedded-translation registry, principally) -- this exists to
+	// measure whether that persistence actually buys anything for a
+	// given guest program, not to assume it does.
+	unsigned bench_runs = 0;
 };
 
 #ifdef HAVE_GETOPT_LONG
@@ -93,6 +109,7 @@ static const struct option long_options[] = {
 	{"nbit-address-space", no_argument, 0, 1007},
 	{"block-split", required_argument, 0, 1008},
 	{"erofs", required_argument, 0, 1009},
+	{"bench-runs", required_argument, 0, 1010},
 	{0, 0, 0, 0}
 };
 
@@ -133,6 +150,8 @@ static void print_help(const char* name)
 		"  -I, --ignore-text  Ignore .text section, and use segments only\n"
 		"  -c, --call func    Call a function after loading the program\n"
 		"      --erofs image    Use an EROFS image as a completely read-only guest root\n"
+		"      --bench-runs N   Re-run the same program N extra times in this process, reporting\n"
+		"                       the first run's time separately from the average of the rest\n"
 		"      --libc-fastpath  Hot-patch memcpy, memset, strlen etc. with native implementations\n"
 		"      --nbit-address-space  Mask arena addresses in translated code instead of bounds-checking them\n"
 		"\n"
@@ -224,6 +243,7 @@ static int parse_arguments(int argc, const char** argv, Arguments& args)
 			case 1007: args.automatic_nbit = true; break;
 			case 1008: args.block_split = atoi(optarg); break;
 			case 1009: args.erofs_image = optarg; break;
+			case 1010: args.bench_runs = atoi(optarg); break;
 			case 'm': // --memory
 				if (optarg) {
 					char* endptr;
@@ -741,6 +761,45 @@ static void run_program(
 #endif
 }
 
+// Calls run_program() cli_args.bench_runs + 1 times in this same process
+// (once always, plus bench_runs extra times when that option is set),
+// timing each call, then reports the first run separately from the
+// average of the rest -- see Arguments::bench_runs's own comment for
+// why this is safe (a fresh Machine and ErofsRuntime every call) and
+// what it's actually trying to measure (whatever persists across runs
+// at the process level, principally the binary translator's own
+// embedded-translation registry -- not something reusing one Machine
+// via Machine::reset() could measure, since Memory::reset() is a
+// documented no-op).
+template <int W>
+static void run_program_benchmarked(
+	const Arguments& cli_args,
+	const std::string_view binary,
+	const bool is_dynamic,
+	const std::vector<std::string>& args,
+	const std::shared_ptr<ErofsFilesystem>& erofs)
+{
+	if (cli_args.bench_runs == 0) {
+		run_program<W>(cli_args, binary, is_dynamic, args, erofs);
+		return;
+	}
+
+	double first_ms = 0.0;
+	double rest_total_ms = 0.0;
+	for (unsigned i = 0; i <= cli_args.bench_runs; i++) {
+		const auto t0 = std::chrono::steady_clock::now();
+		run_program<W>(cli_args, binary, is_dynamic, args, erofs);
+		const auto t1 = std::chrono::steady_clock::now();
+		const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+		if (i == 0)
+			first_ms = ms;
+		else
+			rest_total_ms += ms;
+	}
+	fprintf(stderr, "\n== bench-runs: first run %.3f ms, avg of next %u runs %.3f ms ==\n",
+		first_ms, cli_args.bench_runs, rest_total_ms / double(cli_args.bench_runs));
+}
+
 int main(int argc, const char** argv)
 {
 	Arguments cli_args;
@@ -843,13 +902,13 @@ int main(int argc, const char** argv)
 
 		if (binary[4] == riscv::ELFCLASS64)
 #ifdef RISCV_64I
-			run_program<riscv::RISCV64> (cli_args, binary, is_dynamic, args, erofs);
+			run_program_benchmarked<riscv::RISCV64> (cli_args, binary, is_dynamic, args, erofs);
 #else
 			throw riscv::MachineException(riscv::FEATURE_DISABLED, "64-bit not currently enabled");
 #endif
 		else if (binary[4] == riscv::ELFCLASS32)
 #ifdef RISCV_32I
-			run_program<riscv::RISCV32> (cli_args, binary, is_dynamic, args, erofs);
+			run_program_benchmarked<riscv::RISCV32> (cli_args, binary, is_dynamic, args, erofs);
 #else
 			throw riscv::MachineException(riscv::FEATURE_DISABLED, "32-bit not currently enabled");
 #endif
