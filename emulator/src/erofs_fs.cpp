@@ -249,8 +249,12 @@ template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRunt
 			if (!rt.ready_reported) {
 				const auto elapsed = std::chrono::duration<double, std::milli>(
 					std::chrono::steady_clock::now() - rt.started_at).count();
-				printf("Ready: %.3f ms\n", elapsed);
-				fflush(stdout);
+				// stderr, not stdout: same reasoning as the other
+				// emulator-internal diagnostics fixed earlier -- a
+				// real caller reading fd 1 for the guest's own JSON
+				// response would otherwise get this line mixed in.
+				fprintf(stderr, "Ready: %.3f ms\n", elapsed);
+				fflush(stderr);
 				rt.ready_reported = true;
 			}
 			const int realfd = open_sealed_data("rvlinux-ready", "ok\n");
