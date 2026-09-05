@@ -56,20 +56,25 @@ static void print_address(std::array<char, 128> buffer, address_type<W> addrlen)
 	char printbuf[INET6_ADDRSTRLEN];
 	auto* sin6 = (struct sockaddr_in6 *)buffer.data();
 
+	// stderr, not stdout: this is an emulator-internal syscall trace, not
+	// guest output -- confirmed live, a real worker.py request's actual
+	// stdout (the caller's own JSON response contract) got these lines
+	// interleaved into it, corrupting the parse, since printf() here
+	// writes fd 1 same as the guest's own writes do.
 	switch (sin6->sin6_family) {
 	case AF_INET6:
 		inet_ntop(AF_INET6, &sin6->sin6_addr, printbuf, sizeof(printbuf));
-		printf("SYSCALL -- IPv6 address: %s\n", printbuf);
+		fprintf(stderr, "SYSCALL -- IPv6 address: %s\n", printbuf);
 		break;
 	case AF_INET: {
 		auto* sin4 = (struct sockaddr_in *)buffer.data();
 		inet_ntop(AF_INET, &sin4->sin_addr, printbuf, sizeof(printbuf));
-		printf("SYSCALL -- IPv4 address: %s\n", printbuf);
+		fprintf(stderr, "SYSCALL -- IPv4 address: %s\n", printbuf);
 		break;
 	}
 	case AF_UNIX: {
 		auto* sun = (struct sockaddr_un *)buffer.data();
-		printf("SYSCALL -- UNIX address: %s\n", sun->sun_path);
+		fprintf(stderr, "SYSCALL -- UNIX address: %s\n", sun->sun_path);
 		break;
 	}
 #ifdef HAVE_LINUX_NETLINK
@@ -506,7 +511,8 @@ static void syscall_sendmmsg(Machine<W>& machine)
 			}
 
 		#ifdef SOCKETCALL_VERBOSE
-			printf("SYSCALL -- Vec %zu: Buffers: %u  msg_name=%p namelen: %u\n",
+			// stderr: same reasoning as print_address()'s own comment above.
+			fprintf(stderr, "SYSCALL -- Vec %zu: Buffers: %u  msg_name=%p namelen: %u\n",
 				i, vec_cnt, entry.msg_name, entry.msg_namelen);
 		#endif
 

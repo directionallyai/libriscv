@@ -5,6 +5,7 @@
 #include "threads.hpp"
 #include "util/auxvec.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <errno.h> // Used by emulated POSIX system calls
 #include <random>
 #ifdef __GNUG__ /* Workaround for GCC bug */
@@ -77,10 +78,15 @@ namespace riscv
 	}
 
 	template <int W>
-	void Machine<W>::default_unknown_syscall_no(Machine<W>& machine, size_t num)
+	void Machine<W>::default_unknown_syscall_no(Machine<W>&, size_t num)
 	{
-		auto txt = "Unhandled system call: " + std::to_string(num) + "\n";
-		machine.print(txt.c_str(), txt.size());
+		// stderr, directly, not machine.print(): that callback is the same
+		// fd-1 channel real guest writes use (default_printer() writes fd
+		// 1 unconditionally), so routing this diagnostic through it mixed
+		// emulator-internal notices into a real caller's own guest-stdout
+		// stream -- confirmed live, this exact line corrupted a JSON
+		// response a real worker.py request produced.
+		fprintf(stderr, "Unhandled system call: %zu\n", num);
 	}
 
 	template <int W>
