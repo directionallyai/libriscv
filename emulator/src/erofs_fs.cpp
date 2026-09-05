@@ -4,6 +4,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -289,7 +290,14 @@ template <int W> void setup_erofs_syscalls(riscv::Machine<W>& machine, ErofsRunt
 	Machine::install_syscall_handler(78, [](Machine& m){auto&rt=*m.template get_userdata<ErofsRuntime<W>>();int d=m.template sysarg<int>(0);std::string p=m.memory.memstring(m.sysarg(1));
 		if(p.empty()){m.set_result(-ENOENT);return;}if(p.front()!='/'){if(d==AT_FDCWD)p=join_path(m.fds().cwd,p);else if(auto i=rt.paths.find(d);i!=rt.paths.end())p=join_path(i->second,p);else{m.set_result(-EBADF);return;}}
 		try{auto s=rt.fs->read_link(p);s.resize(std::min<size_t>(s.size(),m.sysarg(3)));m.copy_to_guest(m.sysarg(2),s.data(),s.size());m.set_result(s.size());}catch(const std::exception&e){m.set_result(error_code(e));}});
-	Machine::install_syscall_handler(29, [](Machine& m) { int v=m.template sysarg<int>(0); uint64_t req=m.template sysarg<uint64_t>(1); int fd=m.fds().translate(v); if(fd<0){m.set_result(-EBADF);return;} if(req==0x5451 || req==0x5450){int f=fcntl(fd,F_GETFD);if(f<0){m.set_result(-errno);return;} int r=fcntl(fd,F_SETFD,req==0x5451?f|FD_CLOEXEC:f&~FD_CLOEXEC);m.set_result(r<0?-errno:r);return;} m.set_result(-ENOSYS);});
+	Machine::install_syscall_handler(29, [](Machine& m) { int v=m.template sysarg<int>(0); uint64_t req=m.template sysarg<uint64_t>(1); int fd=m.fds().translate(v); if(fd<0){m.set_result(-EBADF);return;}
+		if(req==0x5451 || req==0x5450){int f=fcntl(fd,F_GETFD);if(f<0){m.set_result(-errno);return;} int r=fcntl(fd,F_SETFD,req==0x5451?f|FD_CLOEXEC:f&~FD_CLOEXEC);m.set_result(r<0?-errno:r);return;}
+		// FIONBIO: toggle non-blocking mode on the real (translated) fd --
+		// confirmed live, a socket connect with a timeout (Python's own
+		// socket.create_connection(), used by every HTTPS client) needs
+		// this and got ENOSYS without it, well before TLS ever started.
+		if(req==0x5421){int32_t enable=m.memory.template read<int32_t>(m.sysarg(2)); int f=fcntl(fd,F_GETFL);if(f<0){m.set_result(-errno);return;} int r=fcntl(fd,F_SETFL,enable?(f|O_NONBLOCK):(f&~O_NONBLOCK));m.set_result(r<0?-errno:0);return;}
+		m.set_result(-ENOSYS);});
 	for(int n:{34,35,36,37,38,53,54,88,276}) Machine::install_syscall_handler(n,[](Machine&m){m.set_result(-EROFS);});
 }
 #ifdef RISCV_32I
